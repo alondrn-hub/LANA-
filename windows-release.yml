@@ -1,0 +1,104 @@
+name: Publish signed Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example, v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      LANA_SIGNING_CERTIFICATE_THUMBPRINT: ${{ secrets.LANA_SIGNING_CERTIFICATE_THUMBPRINT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract reviewed source snapshot
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath release-source.tgz) -or -not (Test-Path -LiteralPath release-source.tgz.sha256)) {
+            throw "The reviewed source archive and its SHA-256 record must both be committed before release."
+          }
+          $expectedHash = (Get-Content -LiteralPath release-source.tgz.sha256 -Raw).Trim().Split(" ")[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath release-source.tgz -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw "The reviewed source archive SHA-256 does not match release-source.tgz.sha256." }
+          New-Item -ItemType Directory -Force -Path source | Out-Null
+          tar -xzf release-source.tgz -C source
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile
+
+      - name: Provision reviewed local runtime
+        working-directory: source/artifacts/sandbox-ide
+        shell: pwsh
+        run: ./installer/windows/provision-runtime.ps1
+
+      - name: Import signing certificate into the runner store
+        shell: pwsh
+        env:
+          LANA_SIGNING_CERTIFICATE_PFX_BASE64: ${{ secrets.LANA_SIGNING_CERTIFICATE_PFX_BASE64 }}
+          LANA_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.LANA_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:LANA_SIGNING_CERTIFICATE_PFX_BASE64 -or -not $env:LANA_SIGNING_CERTIFICATE_PASSWORD -or -not $env:LANA_SIGNING_CERTIFICATE_THUMBPRINT) {
+            throw "Configure the LANA_SIGNING_CERTIFICATE_PFX_BASE64, LANA_SIGNING_CERTIFICATE_PASSWORD, and LANA_SIGNING_CERTIFICATE_THUMBPRINT GitHub Actions secrets before dispatching this workflow."
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "lana-signing-certificate.pfx"
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:LANA_SIGNING_CERTIFICATE_PFX_BASE64))
+          $password = ConvertTo-SecureString -String $env:LANA_SIGNING_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if ($certificate.Thumbprint -ne $env:LANA_SIGNING_CERTIFICATE_THUMBPRINT) {
+            throw "The imported certificate thumbprint does not match LANA_SIGNING_CERTIFICATE_THUMBPRINT."
+          }
+          Remove-Item -LiteralPath $certificatePath -Force
+
+      - name: Build, sign, and verify installer
+        working-directory: source/artifacts/sandbox-ide
+        shell: pwsh
+        run: pnpm desktop:release
+
+      - name: Verify installed app starts bundled local AI
+        working-directory: source/artifacts/sandbox-ide
+        shell: pwsh
+        run: |
+          & ./dist/LANA-DEV-Setup.exe /S
+          if ($LASTEXITCODE -ne 0) { throw "The signed installer did not complete successfully." }
+          $appPath = Join-Path $env:LOCALAPPDATA "Programs\LANA DEV\LANA DEV.exe"
+          if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) { throw "The installer did not place LANA DEV at the expected per-user path." }
+          $app = Start-Process -FilePath $appPath -PassThru
+          $ready = $false
+          for ($attempt = 0; $attempt -lt 90; $attempt += 1) {
+            try {
+              $response = Invoke-WebRequest -Uri http://127.0.0.1:39271/health -TimeoutSec 2
+              if ($response.StatusCode -eq 200) { $ready = $true; break }
+            } catch {}
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) { throw "The installed LANA DEV app did not start its bundled local model." }
+          Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+          Get-Process -Name llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Publish installer and checksum
+        working-directory: source/artifacts/sandbox-ide
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release create $env:RELEASE_TAG ./dist/LANA-DEV-Setup.exe ./dist/LANA-DEV-Setup.exe.sha256 --title "LANA DEV $env:RELEASE_TAG" --generate-notes
